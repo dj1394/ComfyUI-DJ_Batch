@@ -312,6 +312,14 @@ class BatchAudioImport_DJ:
     CATEGORY = "DJ/Batch"
     FUNCTION = "run"
 
+    # 信息面板说明（双击节点 / 悬停 / 右键→信息 可见）。
+    # 支持格式从 AUDIO_EXTS 常量动态拼接，避免和扩展名白名单不同步。
+    DESCRIPTION = (
+        "批量导入音频：每次执行加载一个文件，自动循环，和 WAS Load Image Batch 同一套机制。\n"
+        "路径可填文件夹或 .zip；不同标签独立计数。\n"
+        f"支持格式：{', '.join(sorted(AUDIO_EXTS))}"
+    )
+
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         # 返回 NaN 强制每次执行都重新运行，不走 ComfyUI 缓存。
