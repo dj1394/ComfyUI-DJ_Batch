@@ -58,7 +58,12 @@ def _get_db() -> sqlite3.Connection:
 def _get_next_index(label: str, path: str, sort_mode: str) -> int:
     """
     获取下一个文件索引，并更新数据库。
-    如果路径、过滤规则或排序方式任一变了，重置 index 为 0。
+    
+    重置规则：
+    - 路径变了 → 重置 index 为 0
+    - 排序方式从"固定"切到非固定 → 保留当前 index（从固定文件开始轮询）
+    - 排序方式从非固定切到"固定" → 保留当前 index（停留在当前文件）
+    - 其他排序方式之间切换 → 重置 index 为 0（顺序完全不同）
     （pattern 存进 pattern 列，复用批量批次音频的表结构，不改表）
     """
     conn = _get_db()
@@ -76,11 +81,23 @@ def _get_next_index(label: str, path: str, sort_mode: str) -> int:
             )
         else:
             old_path, old_pattern, old_index = row
-            # 路径/过滤/排序任一变了都重置（排序方式变了文件顺序完全不同）
-            if old_path != path or old_pattern != sort_mode:
+            # 路径变了，重置
+            if old_path != path:
+                new_index = 0
+            # 排序方式切换逻辑
+            elif old_pattern == "固定" and sort_mode != "固定":
+                # 从固定切到非固定：保留当前 index（从固定文件开始轮询）
+                new_index = old_index
+            elif old_pattern != "固定" and sort_mode == "固定":
+                # 从非固定切到固定：保留当前 index（停留在当前文件）
+                new_index = old_index
+            elif old_pattern != sort_mode:
+                # 其他排序方式之间切换：重置（顺序完全不同）
                 new_index = 0
             else:
+                # 相同排序方式：保持进度
                 new_index = old_index
+            
             conn.execute(
                 'UPDATE progress SET path = ?, pattern = ?, "index" = ? WHERE label = ?',
                 (path, sort_mode, new_index, label),
@@ -260,14 +277,8 @@ class BatchImageRotate_DJ:
                     "placeholder": "通配符，如 *.png、图*.jpg；* = 全部",
                     "multiline": False,
                 }),
-                "排序方式": (["自然排序", "文件名正序", "文件名倒序", "随机"], {
+                "排序方式": (["文件名正序", "固定", "文件名倒序", "随机"], {
                     "default": "文件名正序",
-                }),
-                "输出格式": (["RGB", "RGBA"], {
-                    "default": "RGB",
-                }),
-                "文件名带扩展名": (["是", "否"], {
-                    "default": "是",
                 }),
                 "最大文件数": ("INT", {
                     "default": 0,
@@ -275,8 +286,14 @@ class BatchImageRotate_DJ:
                     "max": 500,
                     "step": 1,
                 }),
-                "重置进度": (["否", "是"], {
-                    "default": "否",
+                "RGBA透明通道": (["开", "关"], {
+                    "default": "关",
+                }),
+                "输出带扩展名": (["开", "关"], {
+                    "default": "关",
+                }),
+                "重置进度": (["开", "关"], {
+                    "default": "关",
                 }),
             },
         }
@@ -302,8 +319,8 @@ class BatchImageRotate_DJ:
 
     def run(self, 路径: str, 标签: str = "Batch 001", 文件过滤: str = "*",
             排序方式: str = "文件名正序",
-            输出格式: str = "RGB", 文件名带扩展名: str = "是",
-            最大文件数: int = 0, 重置进度: str = "否"):
+            RGBA透明通道: str = "关", 输出带扩展名: str = "关",
+            最大文件数: int = 0, 重置进度: str = "关"):
         # strip 各种引号：半角 " ' 和全角 “ ” ‘ ’，防止粘贴时带入
         路径 = 路径.strip()
         for q in ('"', "'", '“', '”', '‘', '’'):
@@ -312,7 +329,7 @@ class BatchImageRotate_DJ:
             raise ValueError("路径不能为空，请输入图片文件夹路径")
 
         # ── 重置进度：删掉当前标签的数据库记录 ──
-        if 重置进度 == "是":
+        if 重置进度 == "开":
             conn = _get_db()
             try:
                 conn.execute('DELETE FROM progress WHERE label = ?', (标签,))
@@ -336,13 +353,13 @@ class BatchImageRotate_DJ:
 
         # ── 排序 ──
         # 正序/倒序基于自然排序（数字按数值排，file2 < file10，支持中文数字）；
-        # "自然排序" = 同正序；随机模式每次执行 random.shuffle 重洗 → 真随机、不复现。
+        # 随机模式每次执行 random.shuffle 重洗 → 真随机、不复现。
         if 排序方式 == "文件名倒序":
             image_files.sort(key=_natural_sort_key, reverse=True)
         elif 排序方式 == "随机":
             random.shuffle(image_files)
         else:
-            # "自然排序" 和 "文件名正序" 都是升序
+            # "文件名正序" 升序
             image_files.sort(key=_natural_sort_key)
 
         # ── 截断 ──
@@ -363,22 +380,25 @@ class BatchImageRotate_DJ:
         # ── 解码当前文件 ──
         img = _load_image_file(current_file)
 
-        # 输出格式：默认转 RGB
-        if 输出格式 == "RGB":
+        # RGBA透明通道：关 → 强制转 RGB；开 → 保持原样（有透明才 RGBA，没透明就 RGB）
+        if RGBA透明通道 == "关":
             img = img.convert("RGB")
-        else:
-            img = img.convert("RGBA")
 
         # ── 文件名输出 ──
         filename = current_file.name
-        if 文件名带扩展名 == "否":
+        if 输出带扩展名 == "关":
             filename = os.path.splitext(filename)[0]
 
         # ── 保存下一个进度 ──
-        next_index = index + 1
-        if next_index >= total:
-            next_index = 0  # 循环回开头
-        _save_index(标签, 路径, 排序方式, next_index)
+        if 排序方式 == "固定":
+            # 固定模式：不推进 index，停留在当前文件
+            _save_index(标签, 路径, 排序方式, index)
+        else:
+            # 正常模式：推进到下一个文件
+            next_index = index + 1
+            if next_index >= total:
+                next_index = 0  # 循环回开头
+            _save_index(标签, 路径, 排序方式, next_index)
 
         print(
             f"[ComfyUI-DJ_Batch·批量批次图片] [{标签}] "

@@ -64,7 +64,12 @@ def _get_db() -> sqlite3.Connection:
 def _get_next_index(label: str, path: str, sort_mode: str) -> int:
     """
     获取下一个文件索引，并更新数据库。
-    如果路径或排序方式任一变了，重置 index 为 0。
+    
+    重置规则：
+    - 路径变了 → 重置 index 为 0
+    - 排序方式从"固定"切到非固定 → 保留当前 index（从固定文件开始轮询）
+    - 排序方式从非固定切到"固定" → 保留当前 index（停留在当前文件）
+    - 其他排序方式之间切换 → 重置 index 为 0（顺序完全不同）
     """
     conn = _get_db()
     try:
@@ -81,11 +86,23 @@ def _get_next_index(label: str, path: str, sort_mode: str) -> int:
             )
         else:
             old_path, old_sort, old_index = row
-            # 路径或排序方式任一变了，都重置（排序方式变了文件顺序完全不同）
-            if old_path != path or old_sort != sort_mode:
+            # 路径变了，重置
+            if old_path != path:
+                new_index = 0
+            # 排序方式切换逻辑
+            elif old_sort == "固定" and sort_mode != "固定":
+                # 从固定切到非固定：保留当前 index（从固定文件开始轮询）
+                new_index = old_index
+            elif old_sort != "固定" and sort_mode == "固定":
+                # 从非固定切到固定：保留当前 index（停留在当前文件）
+                new_index = old_index
+            elif old_sort != sort_mode:
+                # 其他排序方式之间切换：重置（顺序完全不同）
                 new_index = 0
             else:
+                # 相同排序方式：保持进度
                 new_index = old_index
+            
             conn.execute(
                 'UPDATE progress SET path = ?, pattern = ?, "index" = ? WHERE label = ?',
                 (path, sort_mode, new_index, label),
@@ -292,7 +309,7 @@ class BatchAudioImport_DJ:
                     "placeholder": "批次标签（不同标签独立计数）",
                     "multiline": False,
                 }),
-                "排序方式": (["自然排序", "文件名正序", "文件名倒序", "随机"], {
+                "排序方式": (["文件名正序", "固定", "文件名倒序", "随机"], {
                     "default": "文件名正序",
                 }),
                 "最大文件数": ("INT", {
@@ -307,8 +324,8 @@ class BatchAudioImport_DJ:
             },
         }
 
-    RETURN_TYPES = ("AUDIO", "STRING")
-    RETURN_NAMES = ("音频", "文件名")
+    RETURN_TYPES = ("AUDIO", "STRING", "FLOAT")
+    RETURN_NAMES = ("音频", "文件名", "时长(秒)")
     CATEGORY = "DJ/Batch"
     FUNCTION = "run"
 
@@ -370,13 +387,13 @@ class BatchAudioImport_DJ:
 
             # ── 排序 ──
             # 正序/倒序基于自然排序（数字按数值排，file2 < file10）；
-            # "自然排序" = 同正序；随机模式每次执行 random.shuffle 重洗 → 真随机、不复现。
+            # 随机模式每次执行 random.shuffle 重洗 → 真随机、不复现。
             if 排序方式 == "文件名倒序":
                 audio_files.sort(key=_natural_sort_key, reverse=True)
             elif 排序方式 == "随机":
                 random.shuffle(audio_files)
             else:
-                # "自然排序" 和 "文件名正序" 都是升序
+                # "文件名正序" 升序
                 audio_files.sort(key=_natural_sort_key)
 
             # ── 截断 ──
@@ -402,10 +419,15 @@ class BatchAudioImport_DJ:
             wav_batched = wav.unsqueeze(0)
 
             # ── 保存下一个进度 ──
-            next_index = index + 1
-            if next_index >= total:
-                next_index = 0  # 循环回开头
-            _save_index(标签, 路径, 排序方式, next_index)
+            if 排序方式 == "固定":
+                # 固定模式：不推进 index，停留在当前文件
+                _save_index(标签, 路径, 排序方式, index)
+            else:
+                # 正常模式：推进到下一个文件
+                next_index = index + 1
+                if next_index >= total:
+                    next_index = 0  # 循环回开头
+                _save_index(标签, 路径, 排序方式, next_index)
 
             print(
                 f"[ComfyUI-DJ_Batch·批量批次音频] [{标签}] "
@@ -413,8 +435,11 @@ class BatchAudioImport_DJ:
                 f"({sr}Hz, {wav.shape[0]}ch, {wav.shape[1]}samples)"
             )
 
-            # 输出 ComfyUI AUDIO dict + 文件名
-            return ({"waveform": wav_batched, "sample_rate": sr}, current_file.name)
+            # 计算时长（秒，精确到小数点后3位）
+            duration = round(wav.shape[1] / sr, 3)
+
+            # 输出 ComfyUI AUDIO dict + 文件名 + 时长
+            return ({"waveform": wav_batched, "sample_rate": sr}, current_file.name, duration)
 
         finally:
             if temp_dir and os.path.exists(temp_dir):
